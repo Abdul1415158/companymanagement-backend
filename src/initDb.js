@@ -7,7 +7,7 @@ const initializeDatabase = async () => {
         const adminExists = await User.findOne({ role: 'SUPER_ADMIN' }).lean();
 
         if (!adminExists) {
-            const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
+            const adminPassword = process.env.ADMIN_PASSWORD || 'Bakr1234@!';
             const adminEmail    = process.env.ADMIN_EMAIL    || 'admin@company.com';
             const adminName     = process.env.ADMIN_NAME     || 'Super Admin';
 
