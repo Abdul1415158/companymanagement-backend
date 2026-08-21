@@ -54,7 +54,7 @@ app.use((err, req, res, next) => {
     res.status(500).json({ message: err.message || 'Something went wrong' });
 });
 
-// DB init (runs once on cold start — works for Vercel serverless too)
+// DB init (runs on startup — works for Vercel serverless too)
 let dbInitialized = false;
 const ensureDB = async () => {
     if (dbInitialized) return;
@@ -63,8 +63,7 @@ const ensureDB = async () => {
         await connectDB();
         await initializeDatabase();
     } catch (err) {
-        console.warn('⚠️  MongoDB not available. Running in-memory mode.');
-        console.warn('Error:', err.message);
+        console.error('MongoDB connection error:', err.message);
     }
 };
 
