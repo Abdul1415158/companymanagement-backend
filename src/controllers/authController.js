@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const Candidate = require('../models/Candidate');
 const { generateToken, validatePassword } = require('../utils/auth');
+const { connectDB } = require('../config/db');
 
 const sanitizeUser = (user) => ({
     id: user._id ? user._id.toString() : (user.id || ''),
@@ -18,7 +19,18 @@ const sanitizeUser = (user) => ({
     lastActive: user.lastActive || null,
 });
 
-const isMongoReady = () => mongoose.connection.readyState === 1;
+/**
+ * Checks if MongoDB is ready. If connection was idle/dropped, attempts auto-reconnect.
+ */
+const isMongoReady = async () => {
+    if (mongoose.connection.readyState === 1) return true;
+    try {
+        await connectDB();
+        return mongoose.connection.readyState === 1;
+    } catch {
+        return false;
+    }
+};
 
 const login = async (req, res) => {
     try {
@@ -28,7 +40,7 @@ const login = async (req, res) => {
             return res.status(400).json({ message: 'Email and password are required.' });
         }
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({
                 message: 'Database connection is currently unavailable. Please check your network/database connection and retry.'
             });
@@ -83,7 +95,7 @@ const register = async (req, res) => {
             return res.status(400).json({ message: pwValidation.message });
         }
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({
                 message: 'Database connection is currently unavailable. Please check your network/database connection.'
             });
@@ -146,7 +158,7 @@ const acceptInvitation = async (req, res) => {
             return res.status(400).json({ message: pwValidation.message });
         }
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({
                 message: 'Database connection is currently unavailable. Please try again in a moment.'
             });
@@ -218,7 +230,7 @@ const verifyInvitation = async (req, res) => {
             return res.status(400).json({ valid: false, message: 'Token and email parameters are required.' });
         }
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ valid: false, message: 'Database connection temporarily unavailable.' });
         }
 
@@ -252,7 +264,7 @@ const logout = async (req, res) => {
         const userId = req.user?.id;
         const now = new Date();
 
-        if (userId && isMongoReady() && mongoose.Types.ObjectId.isValid(userId)) {
+        if (userId && (await isMongoReady()) && mongoose.Types.ObjectId.isValid(userId)) {
             await User.findByIdAndUpdate(userId, {
                 isOnline: false,
                 lastActive: now,
