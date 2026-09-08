@@ -11,8 +11,17 @@ const Payroll = require('../models/Payroll');
 const Project = require('../models/Project');
 const SystemSetting = require('../models/SystemSetting');
 const { validatePassword } = require('../utils/auth');
+const { connectDB } = require('../config/db');
 
-const isMongoReady = () => mongoose.connection.readyState === 1;
+const isMongoReady = async () => {
+    if (mongoose.connection.readyState === 1) return true;
+    try {
+        await connectDB();
+        return mongoose.connection.readyState === 1;
+    } catch {
+        return false;
+    }
+};
 
 // Helper to sanitize and format user objects
 const formatUser = (user) => ({
@@ -53,13 +62,286 @@ const formatCandidate = (c, isCandidateView = false) => {
     return formatted;
 };
 
-// Dashboard summary with real-time active users and statistics
+// Common department mappings for executive scopes
+const TECH_DEPTS = ['Engineering', 'Technology', 'IT', 'Development', 'Software'];
+const MKTG_DEPTS = ['Marketing', 'Creative', 'Design', 'Content', 'Social Media'];
+
+// 1. Dashboard summary with real-time statistics tailored by role (SRS specifications)
 const getDashboardSummary = async (req, res) => {
     try {
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting. Please refresh in a moment.' });
         }
 
+        const userRole = req.user?.role || 'CANDIDATE';
+        const userId = req.user?.id;
+        const userDept = req.user?.department || 'General';
+        const todayStr = new Date().toISOString().slice(0, 10);
+
+        // Fetch common base data
+        const activeUsersList = await User.find({ isOnline: true })
+            .select('name email role department profilePicture isOnline lastLogin')
+            .lean();
+
+        // 1. CANDIDATE Dashboard Metrics
+        if (userRole === 'CANDIDATE') {
+            const userEmail = req.user?.email ? req.user.email.toLowerCase().trim() : '';
+            const myApps = await Candidate.find({
+                $or: [
+                    { userId: mongoose.Types.ObjectId.isValid(userId) ? userId : null },
+                    { email: userEmail }
+                ]
+            }).sort({ createdAt: -1 }).lean();
+
+            return res.json({
+                userRole,
+                myApplicationsCount: myApps.length,
+                myApplications: myApps.map(app => formatCandidate(app, true)),
+                latestApplication: myApps[0] ? formatCandidate(myApps[0], true) : null,
+                activeUsersCount: activeUsersList.length,
+                activeUsers: activeUsersList.map(formatUser),
+            });
+        }
+
+        // 2. EMPLOYEE & INTERN Dashboard Metrics (SRS Page 30 & 61)
+        if (userRole === 'EMPLOYEE' || userRole === 'INTERN') {
+            const [myTasks, myTodayAttendance, myLeaves, myPayrollCount, totalProjects] = await Promise.all([
+                Task.find({ assignedTo: userId }).sort({ createdAt: -1 }).lean(),
+                Attendance.findOne({ userId, date: todayStr }).lean(),
+                Leave.find({ userId }).sort({ createdAt: -1 }).lean(),
+                Payroll.countDocuments({ userId }),
+                Project.countDocuments({ $or: [{ department: userDept }, { ownerId: userId }] })
+            ]);
+
+            const pendingTasks = myTasks.filter(t => ['OPEN', 'ASSIGNED', 'IN_PROGRESS'].includes(t.status)).length;
+            const submittedTasks = myTasks.filter(t => ['SUBMITTED', 'UNDER_REVIEW', 'REVIEW'].includes(t.status)).length;
+            const revisionTasks = myTasks.filter(t => t.status === 'REVISION_REQUIRED').length;
+            const completedTasks = myTasks.filter(t => ['APPROVED', 'DONE', 'COMPLETED'].includes(t.status)).length;
+
+            return res.json({
+                userRole,
+                myTasksCount: myTasks.length,
+                pendingTasks,
+                submittedTasks,
+                revisionTasks,
+                completedTasks,
+                myTasks: myTasks.slice(0, 5),
+                myTodayAttendance: myTodayAttendance ? {
+                    checkIn: myTodayAttendance.checkIn,
+                    checkOut: myTodayAttendance.checkOut,
+                    status: myTodayAttendance.status,
+                } : null,
+                myLeavesCount: myLeaves.length,
+                myPendingLeaves: myLeaves.filter(l => l.status === 'PENDING').length,
+                myPayrollCount,
+                totalProjects,
+                activeUsersCount: activeUsersList.length,
+                activeUsers: activeUsersList.map(formatUser),
+            });
+        }
+
+        // 3. CTO Dashboard Metrics (SRS Page 29 & 30: Tech Projects, Technical Tasks, Active Developers, Tasks Due Today, Overdue Tech Tasks, Intern Progress)
+        if (userRole === 'CTO') {
+            const techDeptRegex = new RegExp(TECH_DEPTS.join('|'), 'i');
+            const [
+                techProjects,
+                techTasks,
+                activeDevs,
+                internsList,
+                todayAttendanceList
+            ] = await Promise.all([
+                Project.find({ department: techDeptRegex }).lean(),
+                Task.find({ department: techDeptRegex }).populate('assignedTo', 'name email role department').lean(),
+                User.find({ department: techDeptRegex, role: { $in: ['EMPLOYEE', 'MANAGER', 'INTERN'] } }).lean(),
+                User.find({ department: techDeptRegex, role: 'INTERN' }).lean(),
+                Attendance.find({ date: todayStr }).populate('userId', 'name email role department').lean()
+            ]);
+
+            const techAttendance = todayAttendanceList.filter(att => 
+                att.userId && (techDeptRegex.test(att.userId.department) || TECH_DEPTS.includes(att.userId.department))
+            );
+
+            const openTasks = techTasks.filter(t => ['OPEN', 'ASSIGNED'].includes(t.status)).length;
+            const inProgressTasks = techTasks.filter(t => t.status === 'IN_PROGRESS').length;
+            const awaitingReviewTasks = techTasks.filter(t => ['SUBMITTED', 'UNDER_REVIEW', 'REVIEW'].includes(t.status)).length;
+            const completedTasks = techTasks.filter(t => ['APPROVED', 'DONE', 'COMPLETED'].includes(t.status)).length;
+
+            const now = new Date();
+            const overdueTasks = techTasks.filter(t => t.dueDate && new Date(t.dueDate) < now && !['APPROVED', 'DONE', 'COMPLETED'].includes(t.status)).length;
+
+            return res.json({
+                userRole,
+                totalProjects: techProjects.length,
+                totalTasks: techTasks.length,
+                openTasks,
+                inProgressTasks,
+                awaitingReviewTasks,
+                completedTasks,
+                overdueTasks,
+                activeDevelopersCount: activeDevs.length,
+                internsCount: internsList.length,
+                todayAttendanceCount: techAttendance.length,
+                todayAttendance: techAttendance.map(att => ({
+                    id: att._id.toString(),
+                    userName: att.userId?.name || 'Developer',
+                    userRole: att.userId?.role || 'EMPLOYEE',
+                    department: att.userId?.department || 'Engineering',
+                    checkIn: att.checkIn,
+                    checkOut: att.checkOut,
+                    status: att.status,
+                })),
+                activeUsersCount: activeUsersList.filter(u => techDeptRegex.test(u.department)).length,
+                activeUsers: activeUsersList.filter(u => techDeptRegex.test(u.department)).map(formatUser),
+            });
+        }
+
+        // 4. CMO Dashboard Metrics (SRS Page 29: Marketing Tasks Today, Designs Pending, Revisions, Awaiting Approval, Active Campaigns, Overdue Tasks)
+        if (userRole === 'CMO') {
+            const mktgDeptRegex = new RegExp(MKTG_DEPTS.join('|'), 'i');
+            const [
+                mktgProjects,
+                mktgTasks,
+                mktgTeam,
+                todayAttendanceList
+            ] = await Promise.all([
+                Project.find({ department: mktgDeptRegex }).lean(),
+                Task.find({ department: mktgDeptRegex }).populate('assignedTo', 'name email role department').lean(),
+                User.find({ department: mktgDeptRegex }).lean(),
+                Attendance.find({ date: todayStr }).populate('userId', 'name email role department').lean()
+            ]);
+
+            const mktgAttendance = todayAttendanceList.filter(att => 
+                att.userId && (mktgDeptRegex.test(att.userId.department) || MKTG_DEPTS.includes(att.userId.department))
+            );
+
+            const designsPending = mktgTasks.filter(t => ['OPEN', 'ASSIGNED', 'IN_PROGRESS'].includes(t.status)).length;
+            const awaitingApproval = mktgTasks.filter(t => ['SUBMITTED', 'UNDER_REVIEW', 'REVIEW'].includes(t.status)).length;
+            const revisionsRequested = mktgTasks.filter(t => t.status === 'REVISION_REQUIRED').length;
+            const completedTasks = mktgTasks.filter(t => ['APPROVED', 'DONE', 'COMPLETED'].includes(t.status)).length;
+
+            const now = new Date();
+            const overdueTasks = mktgTasks.filter(t => t.dueDate && new Date(t.dueDate) < now && !['APPROVED', 'DONE', 'COMPLETED'].includes(t.status)).length;
+
+            return res.json({
+                userRole,
+                totalProjects: mktgProjects.length,
+                totalTasks: mktgTasks.length,
+                designsPending,
+                awaitingApproval,
+                revisionsRequested,
+                completedTasks,
+                overdueTasks,
+                mktgTeamCount: mktgTeam.length,
+                todayAttendanceCount: mktgAttendance.length,
+                todayAttendance: mktgAttendance.map(att => ({
+                    id: att._id.toString(),
+                    userName: att.userId?.name || 'Marketer',
+                    userRole: att.userId?.role || 'EMPLOYEE',
+                    department: att.userId?.department || 'Marketing',
+                    checkIn: att.checkIn,
+                    checkOut: att.checkOut,
+                    status: att.status,
+                })),
+                activeUsersCount: activeUsersList.filter(u => mktgDeptRegex.test(u.department)).length,
+                activeUsers: activeUsersList.filter(u => mktgDeptRegex.test(u.department)).map(formatUser),
+            });
+        }
+
+        // 5. HR Dashboard Metrics (SRS Page 29: Total Employees, Present Today, Absent, Late, On Leave, New Applicants, Interviews, Interns, Payroll Pending)
+        if (userRole === 'HR') {
+            const [
+                totalEmployees,
+                todayAttendanceList,
+                pendingLeaves,
+                candidates,
+                internsCount,
+                payrollCount
+            ] = await Promise.all([
+                User.countDocuments({ role: { $ne: 'CANDIDATE' } }),
+                Attendance.find({ date: todayStr }).populate('userId', 'name email role department').lean(),
+                Leave.countDocuments({ status: 'PENDING' }),
+                Candidate.find({}).lean(),
+                User.countDocuments({ role: 'INTERN' }),
+                Payroll.countDocuments()
+            ]);
+
+            const presentToday = todayAttendanceList.length;
+            const absentToday = Math.max(0, totalEmployees - presentToday);
+            const interviewsCount = candidates.filter(c => c.status === 'INTERVIEW').length;
+            const activeApplicants = candidates.filter(c => !['HIRED', 'REJECTED'].includes(c.status)).length;
+
+            return res.json({
+                userRole,
+                totalEmployees,
+                presentToday,
+                absentToday,
+                pendingLeaves,
+                totalCandidates: candidates.length,
+                activeApplicants,
+                interviewsCount,
+                internsCount,
+                payrollRecords: payrollCount,
+                todayAttendanceCount: todayAttendanceList.length,
+                todayAttendance: todayAttendanceList.map(att => ({
+                    id: att._id.toString(),
+                    userName: att.userId?.name || 'Staff Member',
+                    userRole: att.userId?.role || 'EMPLOYEE',
+                    department: att.userId?.department || 'General',
+                    checkIn: att.checkIn,
+                    checkOut: att.checkOut,
+                    status: att.status,
+                })),
+                activeUsersCount: activeUsersList.length,
+                activeUsers: activeUsersList.map(formatUser),
+            });
+        }
+
+        // 6. MANAGER Dashboard Metrics (Department level visibility)
+        if (userRole === 'MANAGER') {
+            const [
+                deptMembers,
+                deptTasks,
+                deptProjects,
+                deptLeaves,
+                todayAttendanceList
+            ] = await Promise.all([
+                User.find({ department: userDept }).lean(),
+                Task.find({ department: userDept }).populate('assignedTo', 'name email role department').lean(),
+                Project.find({ department: userDept }).lean(),
+                Leave.find({}).populate('userId', 'name email department').lean(),
+                Attendance.find({ date: todayStr }).populate('userId', 'name email role department').lean()
+            ]);
+
+            const teamLeaves = deptLeaves.filter(l => l.userId?.department === userDept && l.status === 'PENDING');
+            const teamAttendance = todayAttendanceList.filter(att => att.userId?.department === userDept);
+            const pendingTasks = deptTasks.filter(t => ['OPEN', 'ASSIGNED', 'IN_PROGRESS'].includes(t.status)).length;
+            const reviewTasks = deptTasks.filter(t => ['SUBMITTED', 'UNDER_REVIEW', 'REVIEW'].includes(t.status)).length;
+
+            return res.json({
+                userRole,
+                department: userDept,
+                teamMembersCount: deptMembers.length,
+                totalTasks: deptTasks.length,
+                pendingTasks,
+                reviewTasks,
+                totalProjects: deptProjects.length,
+                pendingLeaves: teamLeaves.length,
+                todayAttendanceCount: teamAttendance.length,
+                todayAttendance: teamAttendance.map(att => ({
+                    id: att._id.toString(),
+                    userName: att.userId?.name || 'Team Member',
+                    userRole: att.userId?.role || 'EMPLOYEE',
+                    department: att.userId?.department || userDept,
+                    checkIn: att.checkIn,
+                    checkOut: att.checkOut,
+                    status: att.status,
+                })),
+                activeUsersCount: activeUsersList.filter(u => u.department === userDept).length,
+                activeUsers: activeUsersList.filter(u => u.department === userDept).map(formatUser),
+            });
+        }
+
+        // 7. SUPER_ADMIN & CEO Dashboard Metrics (Full Organization Visibility - SRS Page 28 & 62)
         const [
             totalUsers,
             totalAttendance,
@@ -69,35 +351,56 @@ const getDashboardSummary = async (req, res) => {
             totalCandidates,
             totalProjects,
             totalDepartments,
-            activeUsersList,
-            todayAttendanceList
+            todayAttendanceList,
+            candidatesList,
+            allTasksList,
+            internsCount
         ] = await Promise.all([
             User.countDocuments(),
             Attendance.countDocuments(),
-            Leave.countDocuments(),
+            Leave.countDocuments({ status: 'PENDING' }),
             Task.countDocuments(),
             Payroll.countDocuments(),
             Candidate.countDocuments(),
             Project.countDocuments(),
             Department.countDocuments(),
-            User.find({ isOnline: true }).select('name email role department profilePicture isOnline lastLogin').lean(),
-            Attendance.find({ date: new Date().toISOString().slice(0, 10) }).populate('userId', 'name email role department').lean()
+            Attendance.find({ date: todayStr }).populate('userId', 'name email role department').lean(),
+            Candidate.find({}).lean(),
+            Task.find({}).lean(),
+            User.countDocuments({ role: 'INTERN' })
         ]);
 
+        const presentToday = todayAttendanceList.length;
+        const totalEmployeesCount = await User.countDocuments({ role: { $ne: 'CANDIDATE' } });
+        const absentToday = Math.max(0, totalEmployeesCount - presentToday);
+        const interviewsScheduled = candidatesList.filter(c => c.status === 'INTERVIEW').length;
+
+        const now = new Date();
+        const pendingTasks = allTasksList.filter(t => !['APPROVED', 'DONE', 'COMPLETED'].includes(t.status)).length;
+        const overdueTasks = allTasksList.filter(t => t.dueDate && new Date(t.dueDate) < now && !['APPROVED', 'DONE', 'COMPLETED'].includes(t.status)).length;
+
         return res.json({
+            userRole,
             totalUsers,
+            totalEmployees: totalEmployeesCount,
             totalAttendance,
+            presentToday,
+            absentToday,
+            internsCount,
             totalLeaves,
             totalTasks,
+            pendingTasks,
+            overdueTasks,
             totalPayroll,
             totalCandidates,
+            interviewsScheduled,
             totalProjects,
             totalDepartments,
             activeUsersCount: activeUsersList.length,
             activeUsers: activeUsersList.map(formatUser),
             todayAttendanceCount: todayAttendanceList.length,
             todayAttendance: todayAttendanceList.map(att => ({
-                id: att._id ? att._id.toString() : (att.id || ''),
+                id: att._id.toString(),
                 userName: att.userId?.name || 'Staff Member',
                 userRole: att.userId?.role || 'EMPLOYEE',
                 department: att.userId?.department || 'General',
@@ -112,13 +415,26 @@ const getDashboardSummary = async (req, res) => {
     }
 };
 
-// Users Directory
+// 2. Users Directory (Scoped by Role & Department)
 const getUsers = async (req, res) => {
     try {
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting. Please refresh in a moment.' });
         }
-        const users = await User.find({}).sort({ createdAt: -1 }).lean();
+
+        const userRole = req.user?.role;
+        const userDept = req.user?.department;
+
+        let query = {};
+        if (userRole === 'CTO') {
+            query = { department: new RegExp(TECH_DEPTS.join('|'), 'i') };
+        } else if (userRole === 'CMO') {
+            query = { department: new RegExp(MKTG_DEPTS.join('|'), 'i') };
+        } else if (userRole === 'MANAGER') {
+            query = { department: userDept };
+        }
+
+        const users = await User.find(query).sort({ createdAt: -1 }).lean();
         return res.json(users.map(formatUser));
     } catch (err) {
         console.error('Mongo getUsers error:', err);
@@ -126,7 +442,7 @@ const getUsers = async (req, res) => {
     }
 };
 
-// Create Internal User (Super Admin & HR)
+// Create Internal User (Super Admin, CEO & HR)
 const createInternalUser = async (req, res) => {
     try {
         const { name, email, password, role, department, phone } = req.body;
@@ -148,8 +464,8 @@ const createInternalUser = async (req, res) => {
             if (!allowedRolesForHR.includes(role)) {
                 return res.status(403).json({ message: 'HR is only authorized to create Manager, Employee, or Intern accounts.' });
             }
-        } else if (creatorRole !== 'SUPER_ADMIN') {
-            return res.status(403).json({ message: 'Only Super Admin and HR can create internal accounts.' });
+        } else if (!['SUPER_ADMIN', 'CEO'].includes(creatorRole)) {
+            return res.status(403).json({ message: 'Only Super Admin, CEO and HR can create internal accounts.' });
         }
 
         // Enforce password requirements
@@ -158,7 +474,7 @@ const createInternalUser = async (req, res) => {
             return res.status(400).json({ message: pwValidation.message });
         }
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database connection unavailable. Please check connection.' });
         }
 
@@ -211,7 +527,7 @@ const updateUser = async (req, res) => {
             }
         }
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ message: 'Invalid user ID or database disconnected.' });
         }
 
@@ -234,26 +550,35 @@ const updateUser = async (req, res) => {
     }
 };
 
-// Offboard / Delete User (Restricted to Super Admin)
+// Offboard / Delete User (Restricted to Super Admin & CEO)
 const deleteUser = async (req, res) => {
     try {
         const { id } = req.params;
         const requesterRole = req.user?.role;
 
-        if (requesterRole !== 'SUPER_ADMIN') {
-            return res.status(403).json({ message: 'Only Super Admin can remove/offboard users from system.' });
+        if (!['SUPER_ADMIN', 'CEO'].includes(requesterRole)) {
+            return res.status(403).json({ message: 'Only Super Admin or CEO can remove/offboard users from system.' });
         }
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ message: 'Invalid user ID or database disconnected.' });
         }
 
-        const deleted = await User.findByIdAndDelete(id);
-        if (!deleted) return res.status(404).json({ message: 'User not found.' });
-        return res.json({ message: 'User removed / offboarded successfully.' });
+        const targetUser = await User.findById(id);
+        if (!targetUser) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        // Prevent deleting root super admin
+        if (targetUser.role === 'SUPER_ADMIN' && requesterRole !== 'SUPER_ADMIN') {
+            return res.status(403).json({ message: 'Cannot offboard Super Admin.' });
+        }
+
+        await User.findByIdAndDelete(id);
+        return res.json({ message: `User ${targetUser.name} offboarded successfully.` });
     } catch (err) {
         console.error('Mongo deleteUser error:', err);
-        return res.status(500).json({ message: 'Failed to remove user.' });
+        return res.status(500).json({ message: 'Failed to delete user.' });
     }
 };
 
@@ -261,36 +586,42 @@ const deleteUser = async (req, res) => {
 const getProfile = async (req, res) => {
     try {
         const userId = req.user.id;
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
-            return res.status(503).json({ message: 'Database connection unavailable.' });
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
+            return res.status(400).json({ message: 'Invalid user or database disconnected.' });
         }
         const user = await User.findById(userId).lean();
-        if (!user) return res.status(404).json({ message: 'User profile not found' });
+        if (!user) return res.status(404).json({ message: 'User profile not found.' });
         return res.json(formatUser(user));
     } catch (err) {
         console.error('Mongo getProfile error:', err);
-        return res.status(500).json({ message: 'Error retrieving profile.' });
+        return res.status(500).json({ message: 'Failed to retrieve profile.' });
     }
 };
 
 const updateProfile = async (req, res) => {
     try {
         const userId = req.user.id;
-        const { name, phone, department, profilePicture } = req.body;
+        const { name, phone, profilePicture, password } = req.body;
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
-            return res.status(503).json({ message: 'Database connection unavailable.' });
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
+            return res.status(400).json({ message: 'Invalid user or database disconnected.' });
         }
 
         const updateData = {};
-        if (name) updateData.name = name;
-        if (phone !== undefined) updateData.phone = phone;
-        if (department) updateData.department = department;
+        if (name) updateData.name = name.trim();
+        if (phone !== undefined) updateData.phone = phone.trim();
         if (profilePicture !== undefined) updateData.profilePicture = profilePicture;
 
+        if (password) {
+            const pwValidation = validatePassword(password);
+            if (!pwValidation.isValid) {
+                return res.status(400).json({ message: pwValidation.message });
+            }
+            updateData.password = await bcrypt.hash(password, 10);
+        }
+
         const updated = await User.findByIdAndUpdate(userId, updateData, { new: true });
-        if (!updated) return res.status(404).json({ message: 'User not found' });
-        return res.json(formatUser(updated));
+        return res.json({ message: 'Profile updated successfully.', user: formatUser(updated) });
     } catch (err) {
         console.error('Mongo updateProfile error:', err);
         return res.status(500).json({ message: 'Failed to update profile.' });
@@ -300,7 +631,7 @@ const updateProfile = async (req, res) => {
 // Departments
 const getDepartments = async (req, res) => {
     try {
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting.' });
         }
         const departments = await Department.find({}).sort({ createdAt: -1 }).lean();
@@ -316,7 +647,7 @@ const createDepartment = async (req, res) => {
         const { name, description, headId } = req.body;
         if (!name) return res.status(400).json({ message: 'Department name is required.' });
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database connection unavailable.' });
         }
 
@@ -338,18 +669,45 @@ const createDepartment = async (req, res) => {
     }
 };
 
-// Attendance
+// 3. Attendance (Scoped by Role)
 const getAttendance = async (req, res) => {
     try {
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting.' });
         }
-        const rows = await Attendance.find({})
+
+        const userRole = req.user?.role;
+        const userId = req.user?.id;
+        const userDept = req.user?.department;
+
+        let query = {};
+        // Employee & Intern only see their own attendance
+        if (['EMPLOYEE', 'INTERN'].includes(userRole)) {
+            query = { userId };
+        }
+
+        const rows = await Attendance.find(query)
             .populate('userId', 'name email role department profilePicture')
             .sort({ date: -1, createdAt: -1 })
             .lean();
 
-        return res.json(rows.map((row) => ({
+        // Scope attendance by department for managers / CTO / CMO
+        const filteredRows = rows.filter(row => {
+            if (['SUPER_ADMIN', 'CEO', 'HR', 'EMPLOYEE', 'INTERN'].includes(userRole)) return true;
+            const dept = row.userId?.department || row.department;
+            if (userRole === 'CTO') {
+                return TECH_DEPTS.some(d => new RegExp(d, 'i').test(dept));
+            }
+            if (userRole === 'CMO') {
+                return MKTG_DEPTS.some(d => new RegExp(d, 'i').test(dept));
+            }
+            if (userRole === 'MANAGER') {
+                return dept === userDept;
+            }
+            return true;
+        });
+
+        return res.json(filteredRows.map((row) => ({
             ...row,
             id: row._id ? row._id.toString() : (row.id || ''),
             userName: row.userId?.name || row.userName || 'Staff Member',
@@ -370,7 +728,7 @@ const checkIn = async (req, res) => {
         const userId = req.user.id;
         const now = new Date().toISOString();
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
             return res.status(503).json({ message: 'Database connection unavailable.' });
         }
 
@@ -399,7 +757,7 @@ const checkOut = async (req, res) => {
         const userId = req.user.id;
         const now = new Date().toISOString();
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
             return res.status(503).json({ message: 'Database connection unavailable.' });
         }
 
@@ -420,13 +778,29 @@ const checkOut = async (req, res) => {
     }
 };
 
-// Tasks & Work Assignments
+// 4. Tasks & Work Assignments (Scoped by Role & Department)
 const getTasks = async (req, res) => {
     try {
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting.' });
         }
-        const tasks = await Task.find({})
+
+        const userRole = req.user?.role;
+        const userId = req.user?.id;
+        const userDept = req.user?.department;
+
+        let query = {};
+        if (['EMPLOYEE', 'INTERN'].includes(userRole)) {
+            query = { assignedTo: userId };
+        } else if (userRole === 'CTO') {
+            query = { department: new RegExp(TECH_DEPTS.join('|'), 'i') };
+        } else if (userRole === 'CMO') {
+            query = { department: new RegExp(MKTG_DEPTS.join('|'), 'i') };
+        } else if (userRole === 'MANAGER') {
+            query = { department: userDept };
+        }
+
+        const tasks = await Task.find(query)
             .populate('assignedTo', 'name email role department')
             .populate('assignedBy', 'name email role')
             .sort({ createdAt: -1 })
@@ -447,10 +821,19 @@ const getTasks = async (req, res) => {
 
 const createTask = async (req, res) => {
     try {
-        const { title, description, assignedTo, dueDate, department } = req.body;
+        const { title, description, assignedTo, dueDate, department, priority } = req.body;
+        const userRole = req.user?.role;
+        const userDept = req.user?.department;
+
         if (!title) return res.status(400).json({ message: 'Task title is required.' });
 
-        if (!isMongoReady()) {
+        // Scoped department assignment
+        let resolvedDept = department || 'General';
+        if (userRole === 'CTO' && !department) resolvedDept = 'Engineering';
+        if (userRole === 'CMO' && !department) resolvedDept = 'Marketing';
+        if (userRole === 'MANAGER' && !department) resolvedDept = userDept || 'General';
+
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database connection unavailable.' });
         }
 
@@ -459,9 +842,10 @@ const createTask = async (req, res) => {
             description: description || '',
             assignedTo: assignedTo && mongoose.Types.ObjectId.isValid(assignedTo) ? assignedTo : null,
             assignedBy: req.user.id && mongoose.Types.ObjectId.isValid(req.user.id) ? req.user.id : null,
-            department: department || 'General',
+            department: resolvedDept,
+            priority: priority || 'NORMAL',
             dueDate: dueDate || null,
-            status: 'OPEN',
+            status: 'ASSIGNED',
         });
 
         return res.status(201).json({
@@ -470,7 +854,9 @@ const createTask = async (req, res) => {
             description: task.description,
             assignedTo: task.assignedTo,
             dueDate: task.dueDate,
+            priority: task.priority,
             status: task.status,
+            message: 'Task created and assigned successfully.',
         });
     } catch (err) {
         console.error('Mongo createTask error:', err);
@@ -478,47 +864,98 @@ const createTask = async (req, res) => {
     }
 };
 
+// Update task status with Rule 2 enforcement: Employees cannot approve their own work
 const updateTaskStatus = async (req, res) => {
     try {
         const { id } = req.params;
-        const { status } = req.body;
+        const { status, submissionNotes, proofUrl, feedback } = req.body;
+        const userRole = req.user?.role;
 
-        const validStatuses = ['OPEN', 'IN_PROGRESS', 'REVIEW', 'DONE'];
-        if (!validStatuses.includes(status)) {
-            return res.status(400).json({ message: 'Invalid task status.' });
-        }
-
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ message: 'Invalid task ID or database unavailable.' });
         }
 
-        const updated = await Task.findByIdAndUpdate(id, { status }, { new: true });
-        if (!updated) return res.status(404).json({ message: 'Task not found.' });
-        return res.json({ id: updated._id.toString(), status: updated.status, message: 'Task status updated.' });
+        const task = await Task.findById(id);
+        if (!task) return res.status(404).json({ message: 'Task not found.' });
+
+        // Rule 2 Check: Employees/Interns cannot approve their own work
+        if (['EMPLOYEE', 'INTERN'].includes(userRole)) {
+            if (['APPROVED', 'DONE', 'COMPLETED'].includes(status)) {
+                return res.status(403).json({
+                    message: 'Forbidden: Rule 2 Violation — Employees cannot approve their own work. Please submit work for management/lead review.'
+                });
+            }
+        }
+
+        const updateData = {};
+        if (status) updateData.status = status;
+        if (submissionNotes !== undefined) updateData.submissionNotes = submissionNotes;
+        if (proofUrl !== undefined) updateData.proofUrl = proofUrl;
+        if (feedback !== undefined) updateData.feedback = feedback;
+
+        if (status === 'REVISION_REQUIRED') {
+            updateData.revisionsCount = (task.revisionsCount || 0) + 1;
+        }
+
+        const updated = await Task.findByIdAndUpdate(id, updateData, { new: true });
+        return res.json({
+            id: updated._id.toString(),
+            status: updated.status,
+            revisionsCount: updated.revisionsCount,
+            message: `Task status updated to ${updated.status}.`
+        });
     } catch (err) {
         console.error('Mongo updateTaskStatus error:', err);
         return res.status(500).json({ message: 'Failed to update task status.' });
     }
 };
 
-// Leaves
+// 5. Leaves (Scoped by Role & Rule 1: No self-approval)
 const getLeaves = async (req, res) => {
     try {
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting.' });
         }
-        const rows = await Leave.find({})
+
+        const userRole = req.user?.role;
+        const userId = req.user?.id;
+        const userDept = req.user?.department;
+
+        let query = {};
+        if (['EMPLOYEE', 'INTERN'].includes(userRole)) {
+            query = { userId };
+        }
+
+        const rows = await Leave.find(query)
             .populate('userId', 'name email department role')
+            .populate('approvedBy', 'name email role')
             .sort({ createdAt: -1 })
             .lean();
 
-        return res.json(rows.map((row) => ({
+        // Scope leaves by department for managers / CTO / CMO
+        const filteredRows = rows.filter(row => {
+            if (['SUPER_ADMIN', 'CEO', 'HR', 'EMPLOYEE', 'INTERN'].includes(userRole)) return true;
+            const dept = row.userId?.department;
+            if (userRole === 'CTO') {
+                return TECH_DEPTS.some(d => new RegExp(d, 'i').test(dept));
+            }
+            if (userRole === 'CMO') {
+                return MKTG_DEPTS.some(d => new RegExp(d, 'i').test(dept));
+            }
+            if (userRole === 'MANAGER') {
+                return dept === userDept;
+            }
+            return true;
+        });
+
+        return res.json(filteredRows.map((row) => ({
             ...row,
             id: row._id ? row._id.toString() : (row.id || ''),
             userName: row.userId?.name || 'Employee',
             userEmail: row.userId?.email || '',
             department: row.userId?.department || 'General',
             userId: row.userId?._id ? row.userId._id.toString() : (row.userId || ''),
+            approverName: row.approvedBy?.name || null,
         })));
     } catch (err) {
         console.error('Mongo getLeaves error:', err);
@@ -533,7 +970,7 @@ const createLeave = async (req, res) => {
             return res.status(400).json({ message: 'Leave type, start date, and end date are required.' });
         }
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(req.user.id)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(req.user.id)) {
             return res.status(503).json({ message: 'Database connection unavailable.' });
         }
 
@@ -552,37 +989,52 @@ const createLeave = async (req, res) => {
     }
 };
 
+// Update leave status with Rule 1 enforcement: Employees cannot approve their own leaves
 const updateLeaveStatus = async (req, res) => {
     try {
         const { id } = req.params;
         const { status } = req.body;
+        const approverId = req.user.id;
 
         const validStatuses = ['APPROVED', 'REJECTED', 'PENDING'];
         if (!validStatuses.includes(status)) {
             return res.status(400).json({ message: 'Invalid leave status.' });
         }
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ message: 'Invalid leave ID or database unavailable.' });
         }
 
-        const updated = await Leave.findByIdAndUpdate(id, { status }, { new: true });
-        if (!updated) return res.status(404).json({ message: 'Leave record not found.' });
-        return res.json({ id: updated._id.toString(), status: updated.status, message: `Leave ${status.toLowerCase()}.` });
+        const leave = await Leave.findById(id);
+        if (!leave) return res.status(404).json({ message: 'Leave record not found.' });
+
+        // Rule 1 Check: Employees cannot approve their own leave requests
+        if (leave.userId && leave.userId.toString() === approverId.toString()) {
+            return res.status(403).json({
+                message: 'Forbidden: Rule 1 Violation — You cannot approve or reject your own leave request.'
+            });
+        }
+
+        leave.status = status;
+        leave.approvedBy = approverId;
+        await leave.save();
+
+        return res.json({ id: leave._id.toString(), status: leave.status, message: `Leave application ${status.toLowerCase()}.` });
     } catch (err) {
         console.error('Mongo updateLeaveStatus error:', err);
         return res.status(500).json({ message: 'Failed to update leave status.' });
     }
 };
 
-// Candidates & Recruitment
+// 6. Candidates & Recruitment (Scoped by Role)
 const getCandidates = async (req, res) => {
     try {
         const isCandidate = req.user?.role === 'CANDIDATE';
+        const userRole = req.user?.role;
         const userId = req.user?.id;
         const userEmail = req.user?.email;
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting.' });
         }
 
@@ -598,6 +1050,12 @@ const getCandidates = async (req, res) => {
             if (orConditions.length > 0) {
                 query = { $or: orConditions };
             }
+        } else if (['EMPLOYEE', 'INTERN'].includes(userRole)) {
+            return res.status(403).json({ message: 'Forbidden: Candidate records are restricted to talent acquisition and management.' });
+        } else if (userRole === 'CTO') {
+            query = { positionApplied: new RegExp(TECH_DEPTS.join('|') + '|Developer|Engineer', 'i') };
+        } else if (userRole === 'CMO') {
+            query = { positionApplied: new RegExp(MKTG_DEPTS.join('|') + '|Marketing|Designer|Writer', 'i') };
         }
 
         const rows = await Candidate.find(query).sort({ createdAt: -1 }).lean();
@@ -615,7 +1073,7 @@ const createCandidate = async (req, res) => {
             return res.status(400).json({ message: 'Full name and email are required.' });
         }
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database connection unavailable.' });
         }
 
@@ -676,7 +1134,7 @@ const updateCandidateStatus = async (req, res) => {
             return res.status(400).json({ message: 'Invalid candidate stage status.' });
         }
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ message: 'Invalid candidate ID or database disconnected.' });
         }
 
@@ -689,12 +1147,12 @@ const updateCandidateStatus = async (req, res) => {
     }
 };
 
-// Send Candidate Portal Invitation (Generates secure token so candidate can set their own password)
+// Send Candidate Portal Invitation
 const sendCandidateInvitation = async (req, res) => {
     try {
         const { id } = req.params;
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ message: 'Invalid candidate ID or database disconnected.' });
         }
 
@@ -730,7 +1188,7 @@ const sendCandidateInvitation = async (req, res) => {
     }
 };
 
-// Onboard Hired Candidate as an Internal Employee / Staff Profile
+// Onboard Candidate to Staff Roster (HR, CEO, Super Admin)
 const onboardCandidate = async (req, res) => {
     try {
         const { id } = req.params;
@@ -742,7 +1200,7 @@ const onboardCandidate = async (req, res) => {
             return res.status(403).json({ message: 'Only Super Admin can onboard into executive roles.' });
         }
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ message: 'Invalid candidate ID or database disconnected.' });
         }
 
@@ -803,14 +1261,14 @@ const onboardCandidate = async (req, res) => {
     }
 };
 
-// Payroll (Role-governed: HR & Super Admin create/disburse with disburser tracking)
+// 7. Payroll (Scoped: Employees, Interns, Managers, CTO, CMO see ONLY their own payslips; HR & CEO & Super Admin see all)
 const getPayroll = async (req, res) => {
     try {
         const userRole = req.user?.role;
         const userId = req.user?.id;
         const isExecutiveOrHR = ['SUPER_ADMIN', 'HR', 'CEO'].includes(userRole);
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting.' });
         }
 
@@ -850,7 +1308,7 @@ const createPayroll = async (req, res) => {
             return res.status(400).json({ message: 'User, month and basic salary are required.' });
         }
 
-        if (!isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(userId)) {
             return res.status(503).json({ message: 'Database connection unavailable.' });
         }
 
@@ -875,13 +1333,28 @@ const createPayroll = async (req, res) => {
     }
 };
 
-// Projects
+// 8. Projects (Scoped by Department & Role)
 const getProjects = async (req, res) => {
     try {
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting.' });
         }
-        const rows = await Project.find({})
+
+        const userRole = req.user?.role;
+        const userDept = req.user?.department;
+
+        let query = {};
+        if (userRole === 'CTO') {
+            query = { department: new RegExp(TECH_DEPTS.join('|'), 'i') };
+        } else if (userRole === 'CMO') {
+            query = { department: new RegExp(MKTG_DEPTS.join('|'), 'i') };
+        } else if (userRole === 'MANAGER') {
+            query = { department: userDept };
+        } else if (['EMPLOYEE', 'INTERN'].includes(userRole)) {
+            query = { department: userDept };
+        }
+
+        const rows = await Project.find(query)
             .populate('ownerId', 'name email')
             .sort({ createdAt: -1 })
             .lean();
@@ -900,17 +1373,25 @@ const getProjects = async (req, res) => {
 const createProject = async (req, res) => {
     try {
         const { name, description, ownerId, department, status } = req.body;
+        const userRole = req.user?.role;
+        const userDept = req.user?.department;
+
         if (!name) return res.status(400).json({ message: 'Project name is required.' });
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database connection unavailable.' });
         }
+
+        let resolvedDept = department || 'General';
+        if (userRole === 'CTO' && !department) resolvedDept = 'Engineering';
+        if (userRole === 'CMO' && !department) resolvedDept = 'Marketing';
+        if (userRole === 'MANAGER' && !department) resolvedDept = userDept || 'General';
 
         const project = await Project.create({
             name: name.trim(),
             description: description || '',
             ownerId: ownerId && mongoose.Types.ObjectId.isValid(ownerId) ? ownerId : (mongoose.Types.ObjectId.isValid(req.user.id) ? req.user.id : null),
-            department: department || 'General',
+            department: resolvedDept,
             status: status || 'ACTIVE',
         });
 
@@ -921,6 +1402,7 @@ const createProject = async (req, res) => {
             ownerId: project.ownerId,
             department: project.department,
             status: project.status,
+            message: 'Project created successfully.',
         });
     } catch (err) {
         console.error('Mongo createProject error:', err);
@@ -928,10 +1410,10 @@ const createProject = async (req, res) => {
     }
 };
 
-// System Settings
+// 9. System Settings (Restricted to Super Admin & CEO)
 const getSystemSettings = async (req, res) => {
     try {
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database is connecting.' });
         }
         const settings = await SystemSetting.find({}).lean();
@@ -949,7 +1431,7 @@ const updateSystemSettings = async (req, res) => {
             return res.status(400).json({ message: 'Setting key and value are required.' });
         }
 
-        if (!isMongoReady()) {
+        if (!await isMongoReady()) {
             return res.status(503).json({ message: 'Database connection unavailable.' });
         }
 

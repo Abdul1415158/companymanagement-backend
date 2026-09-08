@@ -25,14 +25,50 @@ const taskSchema = new mongoose.Schema(
             type: String,
             default: 'General',
         },
+        priority: {
+            type: String,
+            enum: ['LOW', 'NORMAL', 'HIGH', 'URGENT'],
+            default: 'NORMAL',
+        },
         status: {
             type: String,
-            enum: ['OPEN', 'IN_PROGRESS', 'REVIEW', 'DONE'],
-            default: 'OPEN',
+            enum: [
+                'OPEN',
+                'ASSIGNED',
+                'ACKNOWLEDGED',
+                'IN_PROGRESS',
+                'SUBMITTED',
+                'UNDER_REVIEW',
+                'REVISION_REQUIRED',
+                'RESUBMITTED',
+                'APPROVED',
+                'DONE',
+                'COMPLETED',
+                'BLOCKED',
+                'CANCELLED',
+                'REVIEW',
+            ],
+            default: 'ASSIGNED',
         },
         dueDate: {
             type: Date,
             default: null,
+        },
+        submissionNotes: {
+            type: String,
+            default: '',
+        },
+        proofUrl: {
+            type: String,
+            default: '',
+        },
+        feedback: {
+            type: String,
+            default: '',
+        },
+        revisionsCount: {
+            type: Number,
+            default: 0,
         },
     },
     { timestamps: true }
