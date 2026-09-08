@@ -10,6 +10,13 @@ const Candidate = require('../models/Candidate');
 const Payroll = require('../models/Payroll');
 const Project = require('../models/Project');
 const SystemSetting = require('../models/SystemSetting');
+const Post = require('../models/Post');
+const DailyReport = require('../models/DailyReport');
+const Interview = require('../models/Interview');
+const Shift = require('../models/Shift');
+const Announcement = require('../models/Announcement');
+const Asset = require('../models/Asset');
+const AuditLog = require('../models/AuditLog');
 const { validatePassword } = require('../utils/auth');
 const { connectDB } = require('../config/db');
 
@@ -20,6 +27,26 @@ const isMongoReady = async () => {
         return mongoose.connection.readyState === 1;
     } catch {
         return false;
+    }
+};
+
+const recordAuditLog = async (req, action, moduleName, details, options = {}) => {
+    try {
+        if (!await isMongoReady()) return;
+        await AuditLog.create({
+            userId: req.user?._id || null,
+            userName: req.user?.name || 'System User',
+            userRole: req.user?.role || 'SYSTEM',
+            action,
+            module: moduleName,
+            recordId: options.recordId || '',
+            previousValue: options.previousValue || '',
+            newValue: options.newValue || '',
+            details,
+            ipAddress: req.ip || (req.headers && req.headers['x-forwarded-for']) || '127.0.0.1',
+        });
+    } catch (err) {
+        console.error('Audit log recording error:', err);
     }
 };
 
@@ -1447,6 +1474,765 @@ const updateSystemSettings = async (req, res) => {
     }
 };
 
+// ==========================================
+// 12. POSTS / SOCIAL MEDIA TRACKER (SRS 35 & 36)
+// ==========================================
+const getPosts = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const { platform, status, campaign } = req.query;
+        const filter = {};
+        if (campaign) filter.campaign = campaign;
+        if (status) filter.status = status;
+        if (platform) filter['platforms.name'] = platform;
+
+        const posts = await Post.find(filter)
+            .populate('designer', 'name email')
+            .populate('contentWriter', 'name email')
+            .populate('assignedBy', 'name email')
+            .populate('approvedBy', 'name email')
+            .sort({ createdAt: -1 });
+
+        return res.json(posts.map(p => ({
+            id: p._id.toString(),
+            postId: p.postId,
+            companyBrand: p.companyBrand,
+            campaign: p.campaign,
+            postTitle: p.postTitle,
+            contentType: p.contentType,
+            caption: p.caption,
+            designer: p.designer ? { id: p.designer._id.toString(), name: p.designer.name } : null,
+            contentWriter: p.contentWriter ? { id: p.contentWriter._id.toString(), name: p.contentWriter.name } : null,
+            assignedBy: p.assignedBy ? { id: p.assignedBy._id.toString(), name: p.assignedBy.name } : null,
+            plannedDate: p.plannedDate,
+            plannedTime: p.plannedTime,
+            status: p.status,
+            designAssetUrl: p.designAssetUrl,
+            platforms: p.platforms || [],
+            approvalNotes: p.approvalNotes,
+            approvedBy: p.approvedBy ? { id: p.approvedBy._id.toString(), name: p.approvedBy.name } : null,
+            createdAt: p.createdAt,
+            updatedAt: p.updatedAt,
+        })));
+    } catch (err) {
+        console.error('getPosts error:', err);
+        return res.status(500).json({ message: 'Failed to fetch posts.' });
+    }
+};
+
+const createPost = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const { postTitle, campaign, companyBrand, contentType, caption, designer, contentWriter, plannedDate, plannedTime, platforms } = req.body;
+        if (!postTitle) return res.status(400).json({ message: 'Post title is required.' });
+
+        const post = await Post.create({
+            postTitle,
+            campaign: campaign || 'General Awareness',
+            companyBrand: companyBrand || 'BKR Tech Solutions',
+            contentType: contentType || 'Static Graphic',
+            caption: caption || '',
+            designer: designer && mongoose.Types.ObjectId.isValid(designer) ? designer : null,
+            contentWriter: contentWriter && mongoose.Types.ObjectId.isValid(contentWriter) ? contentWriter : null,
+            assignedBy: req.user?._id || null,
+            plannedDate: plannedDate || '',
+            plannedTime: plannedTime || '',
+            status: 'IDEA',
+            platforms: platforms && platforms.length > 0 ? platforms : [
+                { name: 'LinkedIn', required: true, published: false },
+                { name: 'Facebook', required: true, published: false },
+                { name: 'Instagram', required: true, published: false },
+                { name: 'TikTok', required: true, published: false },
+            ],
+        });
+
+        await recordAuditLog(req, 'CREATE_POST', 'POSTS', `Created social media post: "${postTitle}"`, { recordId: post.postId });
+        return res.status(201).json({ id: post._id.toString(), post, message: 'Post created successfully.' });
+    } catch (err) {
+        console.error('createPost error:', err);
+        return res.status(500).json({ message: 'Failed to create post.' });
+    }
+};
+
+const updatePost = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid post ID or database unavailable.' });
+        }
+        const post = await Post.findById(id);
+        if (!post) return res.status(404).json({ message: 'Post not found.' });
+
+        const { status, caption, designAssetUrl, approvalNotes, platforms, plannedDate, plannedTime, designer } = req.body;
+        const prevStatus = post.status;
+
+        if (status) post.status = status;
+        if (caption !== undefined) post.caption = caption;
+        if (designAssetUrl !== undefined) post.designAssetUrl = designAssetUrl;
+        if (approvalNotes !== undefined) post.approvalNotes = approvalNotes;
+        if (platforms) post.platforms = platforms;
+        if (plannedDate !== undefined) post.plannedDate = plannedDate;
+        if (plannedTime !== undefined) post.plannedTime = plannedTime;
+        if (designer !== undefined) post.designer = designer && mongoose.Types.ObjectId.isValid(designer) ? designer : null;
+
+        if (status === 'APPROVED') {
+            post.approvedBy = req.user?._id || null;
+        }
+
+        await post.save();
+        await recordAuditLog(req, 'UPDATE_POST', 'POSTS', `Updated post "${post.postTitle}" status from ${prevStatus} to ${post.status}`, {
+            recordId: post.postId,
+            previousValue: prevStatus,
+            newValue: post.status,
+        });
+
+        return res.json({ id: post._id.toString(), post, message: 'Post updated successfully.' });
+    } catch (err) {
+        console.error('updatePost error:', err);
+        return res.status(500).json({ message: 'Failed to update post.' });
+    }
+};
+
+const deletePost = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid post ID.' });
+        }
+        const post = await Post.findByIdAndDelete(id);
+        if (!post) return res.status(404).json({ message: 'Post not found.' });
+        await recordAuditLog(req, 'DELETE_POST', 'POSTS', `Deleted post: "${post.postTitle}"`, { recordId: post.postId });
+        return res.json({ message: 'Post deleted successfully.' });
+    } catch (err) {
+        console.error('deletePost error:', err);
+        return res.status(500).json({ message: 'Failed to delete post.' });
+    }
+};
+
+// ==========================================
+// 13. DAILY WORK REPORTS & SLOTS (SRS 21 & 22)
+// ==========================================
+const getDailyReports = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const userRole = req.user?.role;
+        const userId = req.user?._id;
+        const { date, status, department } = req.query;
+
+        const filter = {};
+        if (['EMPLOYEE', 'INTERN'].includes(userRole)) {
+            filter.userId = userId;
+        } else if (userRole === 'MANAGER') {
+            filter.$or = [{ department: req.user?.department }, { userId: userId }];
+        }
+        if (date) filter.date = date;
+        if (status) filter.status = status;
+        if (department && ['SUPER_ADMIN', 'CEO', 'HR', 'CTO', 'CMO'].includes(userRole)) {
+            filter.department = department;
+        }
+
+        const reports = await DailyReport.find(filter)
+            .populate('userId', 'name email department')
+            .populate('reviewedBy', 'name email')
+            .sort({ date: -1, createdAt: -1 });
+
+        return res.json(reports.map(r => ({
+            id: r._id.toString(),
+            reportId: r.reportId,
+            userId: r.userId ? r.userId._id.toString() : '',
+            userName: r.userName || (r.userId?.name || 'Staff Member'),
+            userEmail: r.userId?.email || '',
+            department: r.department || (r.userId?.department || 'General'),
+            date: r.date,
+            taskTitle: r.taskTitle,
+            workSlot: r.workSlot,
+            workCompleted: r.workCompleted,
+            description: r.description,
+            proofUrl: r.proofUrl,
+            screenshotUrl: r.screenshotUrl,
+            blockers: r.blockers,
+            nextAction: r.nextAction,
+            hrRecorded: r.hrRecorded,
+            status: r.status,
+            reviewedBy: r.reviewedBy ? { id: r.reviewedBy._id.toString(), name: r.reviewedBy.name } : null,
+            reviewerName: r.reviewerName,
+            reviewComments: r.reviewComments,
+            createdAt: r.createdAt,
+        })));
+    } catch (err) {
+        console.error('getDailyReports error:', err);
+        return res.status(500).json({ message: 'Failed to fetch daily reports.' });
+    }
+};
+
+const createDailyReport = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const { taskTitle, workSlot, workCompleted, description, proofUrl, screenshotUrl, blockers, nextAction, date } = req.body;
+        if (!taskTitle || !workCompleted) {
+            return res.status(400).json({ message: 'Task title and work completed summary are required.' });
+        }
+
+        const reportDate = date || new Date().toISOString().split('T')[0];
+        const report = await DailyReport.create({
+            userId: req.user._id,
+            userName: req.user.name,
+            department: req.user.department || 'General',
+            date: reportDate,
+            taskTitle,
+            workSlot: workSlot || 'General Hours',
+            workCompleted,
+            description: description || '',
+            proofUrl: proofUrl || '',
+            screenshotUrl: screenshotUrl || '',
+            blockers: blockers || '',
+            nextAction: nextAction || '',
+            status: 'PENDING_REVIEW',
+        });
+
+        await recordAuditLog(req, 'SUBMIT_DAILY_REPORT', 'REPORTS', `Submitted daily report for slot ${report.workSlot}`, { recordId: report.reportId });
+        return res.status(201).json({ id: report._id.toString(), report, message: 'Daily work report submitted successfully.' });
+    } catch (err) {
+        console.error('createDailyReport error:', err);
+        return res.status(500).json({ message: 'Failed to submit daily report.' });
+    }
+};
+
+const reviewDailyReport = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status, reviewComments } = req.body;
+        if (!['APPROVED', 'REVISION_REQUIRED', 'REJECTED'].includes(status)) {
+            return res.status(400).json({ message: 'Invalid review status. Must be APPROVED, REVISION_REQUIRED, or REJECTED.' });
+        }
+
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid report ID or database unavailable.' });
+        }
+
+        const report = await DailyReport.findById(id);
+        if (!report) return res.status(404).json({ message: 'Daily report not found.' });
+
+        // Rule: cannot approve own work
+        if (report.userId.toString() === req.user._id.toString()) {
+            return res.status(403).json({ message: 'Forbidden: You cannot review your own daily work report.' });
+        }
+
+        report.status = status;
+        report.reviewedBy = req.user._id;
+        report.reviewerName = req.user.name;
+        report.reviewComments = reviewComments || '';
+        await report.save();
+
+        await recordAuditLog(req, 'REVIEW_DAILY_REPORT', 'REPORTS', `Marked daily report ${report.reportId} as ${status}`, {
+            recordId: report.reportId,
+            newValue: status,
+        });
+
+        return res.json({ id: report._id.toString(), status: report.status, message: `Report review updated to ${status}.` });
+    } catch (err) {
+        console.error('reviewDailyReport error:', err);
+        return res.status(500).json({ message: 'Failed to review daily report.' });
+    }
+};
+
+const recordDailyReportHR = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid report ID.' });
+        }
+        const report = await DailyReport.findById(id);
+        if (!report) return res.status(404).json({ message: 'Daily report not found.' });
+
+        report.hrRecorded = true;
+        report.hrRecordedAt = new Date();
+        await report.save();
+
+        await recordAuditLog(req, 'HR_RECORD_REPORT', 'REPORTS', `HR acknowledged and recorded daily report ${report.reportId}`, { recordId: report.reportId });
+        return res.json({ id: report._id.toString(), hrRecorded: true, message: 'Report recorded by HR.' });
+    } catch (err) {
+        console.error('recordDailyReportHR error:', err);
+        return res.status(500).json({ message: 'Failed to record daily report.' });
+    }
+};
+
+// ==========================================
+// 14. INTERVIEWS & ATS SCORECARDS (SRS 13 & 14)
+// ==========================================
+const getInterviews = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const { status, date } = req.query;
+        const filter = {};
+        if (status) filter.status = status;
+        if (date) filter.date = date;
+
+        const interviews = await Interview.find(filter)
+            .populate('candidateId', 'fullName email phone positionApplied')
+            .populate('finalDecisionBy', 'name email')
+            .sort({ date: 1, time: 1 });
+
+        return res.json(interviews.map(i => ({
+            id: i._id.toString(),
+            interviewId: i.interviewId,
+            candidateId: i.candidateId ? i.candidateId._id.toString() : null,
+            candidateName: i.candidateName,
+            candidateEmail: i.candidateEmail,
+            position: i.position,
+            interviewType: i.interviewType,
+            date: i.date,
+            time: i.time,
+            platform: i.platform,
+            meetingLink: i.meetingLink,
+            interviewers: i.interviewers || [],
+            status: i.status,
+            technicalRating: i.technicalRating,
+            communicationRating: i.communicationRating,
+            problemSolvingRating: i.problemSolvingRating,
+            culturalFitRating: i.culturalFitRating,
+            overallRating: i.overallRating,
+            recommendation: i.recommendation,
+            feedbackNotes: i.feedbackNotes,
+            finalDecisionBy: i.finalDecisionBy ? { id: i.finalDecisionBy._id.toString(), name: i.finalDecisionBy.name } : null,
+            createdAt: i.createdAt,
+        })));
+    } catch (err) {
+        console.error('getInterviews error:', err);
+        return res.status(500).json({ message: 'Failed to fetch interviews.' });
+    }
+};
+
+const createInterview = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const { candidateName, candidateEmail, position, interviewType, date, time, platform, meetingLink, interviewers, candidateId } = req.body;
+        if (!candidateName || !position || !date || !time) {
+            return res.status(400).json({ message: 'Candidate name, position, date, and time are required.' });
+        }
+
+        const interview = await Interview.create({
+            candidateId: candidateId && mongoose.Types.ObjectId.isValid(candidateId) ? candidateId : null,
+            candidateName,
+            candidateEmail: candidateEmail || '',
+            position,
+            interviewType: interviewType || 'Technical Assessment',
+            date,
+            time,
+            platform: platform || 'Google Meet',
+            meetingLink: meetingLink || '',
+            interviewers: interviewers || [],
+            status: 'SCHEDULED',
+        });
+
+        await recordAuditLog(req, 'SCHEDULE_INTERVIEW', 'INTERVIEWS', `Scheduled interview for ${candidateName} (${position}) on ${date} ${time}`, { recordId: interview.interviewId });
+        return res.status(201).json({ id: interview._id.toString(), interview, message: 'Interview scheduled successfully.' });
+    } catch (err) {
+        console.error('createInterview error:', err);
+        return res.status(500).json({ message: 'Failed to schedule interview.' });
+    }
+};
+
+const updateInterview = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid interview ID.' });
+        }
+
+        const interview = await Interview.findById(id);
+        if (!interview) return res.status(404).json({ message: 'Interview not found.' });
+
+        const {
+            status,
+            technicalRating,
+            communicationRating,
+            problemSolvingRating,
+            culturalFitRating,
+            overallRating,
+            recommendation,
+            feedbackNotes,
+            meetingLink,
+            date,
+            time,
+        } = req.body;
+
+        if (status) interview.status = status;
+        if (technicalRating !== undefined) interview.technicalRating = technicalRating;
+        if (communicationRating !== undefined) interview.communicationRating = communicationRating;
+        if (problemSolvingRating !== undefined) interview.problemSolvingRating = problemSolvingRating;
+        if (culturalFitRating !== undefined) interview.culturalFitRating = culturalFitRating;
+        if (overallRating !== undefined) interview.overallRating = overallRating;
+        if (recommendation) interview.recommendation = recommendation;
+        if (feedbackNotes !== undefined) interview.feedbackNotes = feedbackNotes;
+        if (meetingLink !== undefined) interview.meetingLink = meetingLink;
+        if (date) interview.date = date;
+        if (time) interview.time = time;
+
+        interview.finalDecisionBy = req.user?._id || null;
+        await interview.save();
+
+        await recordAuditLog(req, 'UPDATE_INTERVIEW', 'INTERVIEWS', `Evaluated interview ${interview.interviewId} - Recommendation: ${interview.recommendation}`, { recordId: interview.interviewId });
+        return res.json({ id: interview._id.toString(), interview, message: 'Interview updated successfully.' });
+    } catch (err) {
+        console.error('updateInterview error:', err);
+        return res.status(500).json({ message: 'Failed to update interview.' });
+    }
+};
+
+const deleteInterview = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid interview ID.' });
+        }
+        await Interview.findByIdAndDelete(id);
+        return res.json({ message: 'Interview deleted successfully.' });
+    } catch (err) {
+        console.error('deleteInterview error:', err);
+        return res.status(500).json({ message: 'Failed to delete interview.' });
+    }
+};
+
+// ==========================================
+// 15. SHIFTS MANAGEMENT (SRS 19 & 20)
+// ==========================================
+const getShifts = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        let shifts = await Shift.find({ isActive: true }).sort({ createdAt: 1 });
+        
+        if (shifts.length === 0) {
+            const defaults = [
+                {
+                    name: 'Night Shift (Aymen Graphic Designer / Tech)',
+                    startTime: '08:00 PM',
+                    endTime: '01:30 AM',
+                    graceMinutes: 10,
+                    halfDayHours: 4,
+                    expectedHours: 5.5,
+                    department: 'Engineering / Design',
+                    isNightShift: true,
+                    description: 'Official evening slot: 8:00 PM - 1:30 AM'
+                },
+                {
+                    name: 'Day Shift (Operations & HR)',
+                    startTime: '09:00 AM',
+                    endTime: '06:00 PM',
+                    graceMinutes: 15,
+                    halfDayHours: 4.5,
+                    expectedHours: 9,
+                    department: 'Operations',
+                    isNightShift: false,
+                    description: 'Standard office business hours'
+                },
+            ];
+            shifts = await Shift.insertMany(defaults);
+        }
+
+        return res.json(shifts.map(s => ({
+            id: s._id.toString(),
+            shiftCode: s.shiftCode,
+            name: s.name,
+            startTime: s.startTime,
+            endTime: s.endTime,
+            graceMinutes: s.graceMinutes,
+            halfDayHours: s.halfDayHours,
+            expectedHours: s.expectedHours,
+            department: s.department,
+            isNightShift: s.isNightShift,
+            description: s.description,
+            isActive: s.isActive,
+        })));
+    } catch (err) {
+        console.error('getShifts error:', err);
+        return res.status(500).json({ message: 'Failed to fetch shifts.' });
+    }
+};
+
+const createShift = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const { name, startTime, endTime, graceMinutes, halfDayHours, expectedHours, department, isNightShift, description } = req.body;
+        if (!name || !startTime || !endTime) {
+            return res.status(400).json({ message: 'Shift name, start time, and end time are required.' });
+        }
+
+        const shift = await Shift.create({
+            name,
+            startTime,
+            endTime,
+            graceMinutes: graceMinutes !== undefined ? Number(graceMinutes) : 10,
+            halfDayHours: halfDayHours !== undefined ? Number(halfDayHours) : 4,
+            expectedHours: expectedHours !== undefined ? Number(expectedHours) : 5.5,
+            department: department || 'All',
+            isNightShift: Boolean(isNightShift),
+            description: description || '',
+        });
+
+        await recordAuditLog(req, 'CREATE_SHIFT', 'SYSTEM', `Created work shift: "${name}" (${startTime} - ${endTime})`, { recordId: shift.shiftCode });
+        return res.status(201).json({ id: shift._id.toString(), shift, message: 'Shift created successfully.' });
+    } catch (err) {
+        console.error('createShift error:', err);
+        return res.status(500).json({ message: 'Failed to create shift.' });
+    }
+};
+
+// ==========================================
+// 16. ANNOUNCEMENTS & NOTICES (SRS 37 & 38)
+// ==========================================
+const getAnnouncements = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const userDept = req.user?.department || 'General';
+        const userRole = req.user?.role || 'EMPLOYEE';
+
+        const filter = {
+            isActive: true,
+            $or: [
+                { audience: 'ALL' },
+                { audience: userDept },
+                { audience: userRole === 'INTERN' ? 'Interns' : 'ALL' },
+            ]
+        };
+
+        const announcements = await Announcement.find(filter).sort({ priority: -1, createdAt: -1 });
+        return res.json(announcements.map(a => ({
+            id: a._id.toString(),
+            announcementId: a.announcementId,
+            title: a.title,
+            message: a.message,
+            audience: a.audience,
+            priority: a.priority,
+            category: a.category,
+            publisherName: a.publisherName,
+            publishDate: a.publishDate,
+            createdAt: a.createdAt,
+        })));
+    } catch (err) {
+        console.error('getAnnouncements error:', err);
+        return res.status(500).json({ message: 'Failed to fetch announcements.' });
+    }
+};
+
+const createAnnouncement = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const { title, message, audience, priority, category } = req.body;
+        if (!title || !message) {
+            return res.status(400).json({ message: 'Title and message are required.' });
+        }
+
+        const announcement = await Announcement.create({
+            title,
+            message,
+            audience: audience || 'ALL',
+            priority: priority || 'NORMAL',
+            category: category || 'Company Update',
+            publishedBy: req.user?._id || null,
+            publisherName: req.user?.name || 'BKR Administration',
+        });
+
+        await recordAuditLog(req, 'CREATE_ANNOUNCEMENT', 'SYSTEM', `Published company announcement: "${title}" (${priority})`, { recordId: announcement.announcementId });
+        return res.status(201).json({ id: announcement._id.toString(), announcement, message: 'Announcement published successfully.' });
+    } catch (err) {
+        console.error('createAnnouncement error:', err);
+        return res.status(500).json({ message: 'Failed to publish announcement.' });
+    }
+};
+
+const deleteAnnouncement = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid announcement ID.' });
+        }
+        await Announcement.findByIdAndDelete(id);
+        return res.json({ message: 'Announcement deleted.' });
+    } catch (err) {
+        console.error('deleteAnnouncement error:', err);
+        return res.status(500).json({ message: 'Failed to delete announcement.' });
+    }
+};
+
+// ==========================================
+// 17. ASSET / EQUIPMENT MANAGEMENT (SRS 53)
+// ==========================================
+const getAssets = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const userRole = req.user?.role;
+        const userId = req.user?._id;
+
+        const filter = {};
+        if (['EMPLOYEE', 'INTERN'].includes(userRole)) {
+            filter.assignedTo = userId;
+        }
+
+        const assets = await Asset.find(filter)
+            .populate('assignedTo', 'name email department')
+            .sort({ createdAt: -1 });
+
+        return res.json(assets.map(a => ({
+            id: a._id.toString(),
+            assetId: a.assetId,
+            assetName: a.assetName,
+            assetType: a.assetType,
+            brand: a.brand,
+            model: a.model,
+            serialNumber: a.serialNumber,
+            assignedTo: a.assignedTo ? { id: a.assignedTo._id.toString(), name: a.assignedTo.name } : null,
+            assignedToName: a.assignedTo ? a.assignedTo.name : a.assignedToName,
+            assignedDepartment: a.assignedDepartment,
+            assignmentDate: a.assignmentDate,
+            condition: a.condition,
+            returnDate: a.returnDate,
+            status: a.status,
+            notes: a.notes,
+            createdAt: a.createdAt,
+        })));
+    } catch (err) {
+        console.error('getAssets error:', err);
+        return res.status(500).json({ message: 'Failed to fetch assets.' });
+    }
+};
+
+const createAsset = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const { assetName, assetType, brand, model, serialNumber, assignedTo, condition, notes } = req.body;
+        if (!assetName || !assetType) {
+            return res.status(400).json({ message: 'Asset name and type are required.' });
+        }
+
+        let assignedEmployeeName = 'Unassigned';
+        let assignedDept = 'IT / Operations';
+        let assignmentDateStr = '';
+        let initialStatus = 'AVAILABLE';
+
+        if (assignedTo && mongoose.Types.ObjectId.isValid(assignedTo)) {
+            const user = await User.findById(assignedTo);
+            if (user) {
+                assignedEmployeeName = user.name;
+                assignedDept = user.department || 'General';
+                assignmentDateStr = new Date().toISOString().split('T')[0];
+                initialStatus = 'ASSIGNED';
+            }
+        }
+
+        const asset = await Asset.create({
+            assetName,
+            assetType,
+            brand: brand || '',
+            model: model || '',
+            serialNumber: serialNumber || '',
+            assignedTo: assignedTo && mongoose.Types.ObjectId.isValid(assignedTo) ? assignedTo : null,
+            assignedToName: assignedEmployeeName,
+            assignedDepartment: assignedDept,
+            assignmentDate: assignmentDateStr,
+            condition: condition || 'Good / Operational',
+            status: initialStatus,
+            notes: notes || '',
+        });
+
+        await recordAuditLog(req, 'CREATE_ASSET', 'ASSETS', `Registered asset ${asset.assetId}: ${assetName} (${assetType})`, { recordId: asset.assetId });
+        return res.status(201).json({ id: asset._id.toString(), asset, message: 'Asset registered successfully.' });
+    } catch (err) {
+        console.error('createAsset error:', err);
+        return res.status(500).json({ message: 'Failed to register asset.' });
+    }
+};
+
+const updateAsset = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid asset ID.' });
+        }
+
+        const asset = await Asset.findById(id);
+        if (!asset) return res.status(404).json({ message: 'Asset not found.' });
+
+        const { assignedTo, condition, status, notes, returnDate } = req.body;
+
+        if (assignedTo !== undefined) {
+            if (assignedTo && mongoose.Types.ObjectId.isValid(assignedTo)) {
+                const user = await User.findById(assignedTo);
+                asset.assignedTo = user._id;
+                asset.assignedToName = user.name;
+                asset.assignedDepartment = user.department || 'General';
+                asset.assignmentDate = new Date().toISOString().split('T')[0];
+                asset.status = 'ASSIGNED';
+            } else {
+                asset.assignedTo = null;
+                asset.assignedToName = 'Unassigned';
+                asset.status = 'AVAILABLE';
+            }
+        }
+
+        if (condition) asset.condition = condition;
+        if (status) asset.status = status;
+        if (notes !== undefined) asset.notes = notes;
+        if (returnDate !== undefined) asset.returnDate = returnDate;
+
+        await asset.save();
+        await recordAuditLog(req, 'UPDATE_ASSET', 'ASSETS', `Updated asset ${asset.assetId} - Status: ${asset.status}`, { recordId: asset.assetId });
+
+        return res.json({ id: asset._id.toString(), asset, message: 'Asset updated successfully.' });
+    } catch (err) {
+        console.error('updateAsset error:', err);
+        return res.status(500).json({ message: 'Failed to update asset.' });
+    }
+};
+
+const deleteAsset = async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!await isMongoReady() || !mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid asset ID.' });
+        }
+        await Asset.findByIdAndDelete(id);
+        return res.json({ message: 'Asset deleted successfully.' });
+    } catch (err) {
+        console.error('deleteAsset error:', err);
+        return res.status(500).json({ message: 'Failed to delete asset.' });
+    }
+};
+
+// ==========================================
+// 18. AUDIT LOGS (SRS 54)
+// ==========================================
+const getAuditLogs = async (req, res) => {
+    try {
+        if (!await isMongoReady()) return res.status(503).json({ message: 'Database unavailable' });
+        const { module: moduleFilter } = req.query;
+        const filter = {};
+        if (moduleFilter) filter.module = moduleFilter;
+
+        const logs = await AuditLog.find(filter)
+            .sort({ createdAt: -1 })
+            .limit(150);
+
+        return res.json(logs.map(l => ({
+            id: l._id.toString(),
+            userId: l.userId ? l.userId.toString() : null,
+            userName: l.userName,
+            userRole: l.userRole,
+            action: l.action,
+            module: l.module,
+            recordId: l.recordId,
+            previousValue: l.previousValue,
+            newValue: l.newValue,
+            details: l.details,
+            ipAddress: l.ipAddress,
+            timestamp: l.createdAt,
+        })));
+    } catch (err) {
+        console.error('getAuditLogs error:', err);
+        return res.status(500).json({ message: 'Failed to fetch audit logs.' });
+    }
+};
+
 module.exports = {
     getDashboardSummary,
     getUsers,
@@ -1477,4 +2263,29 @@ module.exports = {
     createProject,
     getSystemSettings,
     updateSystemSettings,
+    // SRS Extensions
+    getPosts,
+    createPost,
+    updatePost,
+    deletePost,
+    getDailyReports,
+    createDailyReport,
+    reviewDailyReport,
+    recordDailyReportHR,
+    getInterviews,
+    createInterview,
+    updateInterview,
+    deleteInterview,
+    getShifts,
+    createShift,
+    getAnnouncements,
+    createAnnouncement,
+    deleteAnnouncement,
+    getAssets,
+    createAsset,
+    updateAsset,
+    deleteAsset,
+    getAuditLogs,
+    recordAuditLog,
 };
+

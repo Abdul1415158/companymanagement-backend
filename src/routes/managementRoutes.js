@@ -29,6 +29,29 @@ const {
     createProject,
     getSystemSettings,
     updateSystemSettings,
+    // SRS Extensions
+    getPosts,
+    createPost,
+    updatePost,
+    deletePost,
+    getDailyReports,
+    createDailyReport,
+    reviewDailyReport,
+    recordDailyReportHR,
+    getInterviews,
+    createInterview,
+    updateInterview,
+    deleteInterview,
+    getShifts,
+    createShift,
+    getAnnouncements,
+    createAnnouncement,
+    deleteAnnouncement,
+    getAssets,
+    createAsset,
+    updateAsset,
+    deleteAsset,
+    getAuditLogs,
 } = require('../controllers/managementController');
 const { authMiddleware, authorize } = require('../middleware/auth');
 
@@ -88,5 +111,41 @@ router.post('/projects', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'CTO', 
 // 11. System Settings (Restricted to Super Admin & CEO)
 router.get('/system-settings', authMiddleware, authorize('SUPER_ADMIN', 'CEO'), getSystemSettings);
 router.post('/system-settings', authMiddleware, authorize('SUPER_ADMIN', 'CEO'), updateSystemSettings);
+
+// 12. Posts / Social Media Tracking (SRS 35 & 36)
+router.get('/posts', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'CMO', 'MANAGER', 'EMPLOYEE', 'INTERN'), getPosts);
+router.post('/posts', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'CMO', 'MANAGER'), createPost);
+router.patch('/posts/:id', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'CMO', 'MANAGER', 'EMPLOYEE', 'INTERN'), updatePost);
+router.delete('/posts/:id', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'CMO'), deletePost);
+
+// 13. Daily Work Reports & Slots (SRS 21 & 22)
+router.get('/daily-reports', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'CTO', 'CMO', 'HR', 'MANAGER', 'EMPLOYEE', 'INTERN'), getDailyReports);
+router.post('/daily-reports', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'CTO', 'CMO', 'HR', 'MANAGER', 'EMPLOYEE', 'INTERN'), createDailyReport);
+router.patch('/daily-reports/:id/review', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'CTO', 'CMO', 'MANAGER'), reviewDailyReport);
+router.patch('/daily-reports/:id/record', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR'), recordDailyReportHR);
+
+// 14. Interviews & ATS Scheduling (SRS 13 & 14)
+router.get('/interviews', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR', 'CTO', 'CMO', 'MANAGER'), getInterviews);
+router.post('/interviews', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR'), createInterview);
+router.patch('/interviews/:id', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR', 'CTO', 'CMO', 'MANAGER'), updateInterview);
+router.delete('/interviews/:id', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR'), deleteInterview);
+
+// 15. Shifts (SRS 19 & 20)
+router.get('/shifts', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR', 'CTO', 'CMO', 'MANAGER', 'EMPLOYEE', 'INTERN'), getShifts);
+router.post('/shifts', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR'), createShift);
+
+// 16. Announcements (SRS 37 & 38)
+router.get('/announcements', authMiddleware, getAnnouncements);
+router.post('/announcements', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR', 'CTO', 'CMO', 'MANAGER'), createAnnouncement);
+router.delete('/announcements/:id', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR'), deleteAnnouncement);
+
+// 17. Assets & Equipment Inventory (SRS 53)
+router.get('/assets', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR', 'CTO', 'CMO', 'MANAGER', 'EMPLOYEE', 'INTERN'), getAssets);
+router.post('/assets', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR'), createAsset);
+router.patch('/assets/:id', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR'), updateAsset);
+router.delete('/assets/:id', authMiddleware, authorize('SUPER_ADMIN', 'CEO', 'HR'), deleteAsset);
+
+// 18. Audit Logs (SRS 54 - Super Admin & CEO only)
+router.get('/audit-logs', authMiddleware, authorize('SUPER_ADMIN', 'CEO'), getAuditLogs);
 
 module.exports = router;
